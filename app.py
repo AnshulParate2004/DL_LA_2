@@ -1,151 +1,172 @@
+import io, sys, json
+from pathlib import Path
+from collections import Counter
+
+sys.path.insert(0, str(Path(__file__).parent))
+
 import streamlit as st
-import numpy as np
-import json
-import io
-from PIL import Image, ImageDraw, ImageFont
-from ultralytics import YOLO
-from salg import SALG, Detection, SemanticGroup, groups_to_json
+from PIL import Image as PILImage
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 
-# ── Config ───────────────────────────────────────────────────────────────────
-MODEL_PATH = "yolo26s_doclaynet_best.pt"
+from salg.salg import (
+    SALG, Detection,
+    CLASSES, GROUP_REMAP,
+    DETECTION_COLORS, GROUP_COLORS,
+    groups_to_json,
+)
 
-CLASSES = [
-    'Caption', 'Footnote', 'Formula', 'List-item', 'Page-footer',
-    'Page-header', 'Picture', 'Section-header', 'Table', 'Text', 'Title'
-]
+st.set_page_config(page_title="DocLayout YOLO + SALG", page_icon="📄", layout="wide")
 
-REMAP = {
-    'Title'          : 'Text',
-    'Section-header' : 'Picture',
-}
+INFER_CONF  = 0.25
+INFER_IOU   = 0.45
+INFER_IMGSZ = 1280
+SALG_VERT_GAP  = 0.06
+SALG_NMS_IOU   = 0.45
+SALG_MIN_CONF  = 0.35
+SALG_FLOAT_GAP = 0.03
 
-GROUP_COLORS = {
-    'text'            : '#3498DB',
-    'title'           : '#27AE60',
-    'image'           : '#F39C12',
-    'flow'            : '#3498DB',
-    'margin'          : '#95A5A6',
-    'isolated_caption': '#BDC3C7',
-}
+@st.cache_resource(show_spinner="Loading model…")
+def load_model(path: str):
+    from ultralytics import YOLO
+    return YOLO(path)
 
-GROUP_REMAP = {
-    'float'  : 'title',
-    'title'  : 'text',
-    'section': 'image',
-}
-
-# ── Load model once ───────────────────────────────────────────────────────────
-@st.cache_resource
-def load_model():
-    return YOLO(MODEL_PATH)
-
-# ── Helper: smart remap ───────────────────────────────────────────────────────
-def smart_remap(d):
-    name = REMAP.get(d.cls_name, d.cls_name)
-    if d.cls_name == 'Table':
-        aspect = d.w / max(d.h, 1)
-        if aspect > 4:
-            name = 'Text'
-    return Detection(
-        cls_name = name,
-        cls_id   = CLASSES.index(name),
-        conf     = d.conf,
-        box      = d.box
-    )
-
-# ── Helper: draw groups on image ──────────────────────────────────────────────
-def draw_groups(img: Image.Image, groups) -> Image.Image:
-    img = img.copy().convert('RGBA')
-    overlay = Image.new('RGBA', img.size, (0,0,0,0))
-    draw = ImageDraw.Draw(overlay)
-
-    for g in groups:
-        x1,y1,x2,y2 = g.bbox
-        label = GROUP_REMAP.get(g.group_type, g.group_type)
-        hex_c = GROUP_COLORS.get(label, '#AAAAAA').lstrip('#')
-        r,g_c,b = tuple(int(hex_c[i:i+2],16) for i in (0,2,4))
-
-        # Fill
-        draw.rectangle([x1,y1,x2,y2], fill=(r,g_c,b,30))
-        # Border
-        draw.rectangle([x1,y1,x2,y2], outline=(r,g_c,b,220), width=2)
-        # Label
-        draw.rectangle([x1,y1,x1+120,y1+18], fill=(r,g_c,b,200))
-        draw.text((x1+4,y1+2), f'#{g.reading_order} {label}', fill=(255,255,255,255))
-
-    return Image.alpha_composite(img, overlay).convert('RGB')
-
-# ── Streamlit UI ──────────────────────────────────────────────────────────────
-st.set_page_config(page_title='Document Layout Analyser', layout='wide')
-st.title('📄 Document Layout Analyser')
-st.caption('Upload a document image — YOLO + SALG will detect and group layout elements.')
-
-uploaded = st.file_uploader('Upload image', type=['png','jpg','jpeg','webp'])
-
-with st.sidebar:
-    st.header('⚙️ Settings')
-    conf_thresh = st.slider('YOLO confidence',  0.10, 0.80, 0.25, 0.05)
-    iou_thresh  = st.slider('YOLO IoU',         0.10, 0.80, 0.45, 0.05)
-    min_conf    = st.slider('SALG min conf',     0.10, 0.80, 0.35, 0.05)
-    show_json   = st.checkbox('Show JSON output', value=True)
-
-if uploaded:
-    img = Image.open(uploaded).convert('RGB')
-    img_w, img_h = img.size
-
-    with st.spinner('Running inference...'):
-        model = load_model()
-        result = model(
-            np.array(img),
-            imgsz=1280, conf=conf_thresh, iou=iou_thresh,
-            device='cpu', verbose=False
-        )[0]
-
-    # Build detections
-    detections = [
-        Detection(CLASSES[int(b.cls)], int(b.cls), float(b.conf), tuple(b.xyxy[0].tolist()))
+def run_inference(model, img, device):
+    result = model(img, imgsz=INFER_IMGSZ, conf=INFER_CONF,
+                   iou=INFER_IOU, device=device, verbose=False)[0]
+    iw, ih = img.size
+    return [
+        Detection(CLASSES[int(b.cls)], int(b.cls),
+                  float(b.conf), tuple(b.xyxy[0].tolist()))
         for b in result.boxes
-    ]
+    ], iw, ih
 
-    # Remap labels
-    detections = [smart_remap(d) for d in detections]
-
-    # Run SALG
-    salg = SALG(img_h=img_h, img_w=img_w, min_conf=min_conf)
+def run_salg(detections, iw, ih):
+    salg = SALG(img_h=ih, img_w=iw,
+                vert_gap_ratio=SALG_VERT_GAP, nms_iou_thresh=SALG_NMS_IOU,
+                min_conf=SALG_MIN_CONF, float_merge_gap=SALG_FLOAT_GAP)
     groups = salg.group(detections)
-
-    # Rename group types
     for g in groups:
         g.group_type = GROUP_REMAP.get(g.group_type, g.group_type)
+    return groups, salg
 
-    # Draw
-    annotated = draw_groups(img, groups)
+def build_figure(img, detections, groups):
+    fig, axes = plt.subplots(1, 2, figsize=(22, 14))
 
-    # Display
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader('Original')
-        st.image(img, use_container_width=True)
-    with col2:
-        st.subheader(f'Layout Groups ({len(groups)} found)')
-        st.image(annotated, use_container_width=True)
+    ax = axes[0]
+    ax.imshow(img)
+    ax.set_title('YOLO Raw Detections', fontsize=14, fontweight='bold')
+    for det in detections:
+        x1, y1, x2, y2 = det.box
+        c = DETECTION_COLORS.get(det.cls_name, '#AAAAAA')
+        ax.add_patch(patches.Rectangle((x1,y1), x2-x1, y2-y1,
+                     linewidth=1.5, edgecolor=c, facecolor='none', alpha=0.9))
+        ax.text(x1+2, y1-4, f'{det.cls_name} {det.conf:.2f}',
+                fontsize=6, color=c,
+                bbox=dict(facecolor='white', alpha=0.5, pad=1, edgecolor='none'))
+    ax.axis('off')
 
-    # Download annotated image
-    buf = io.BytesIO()
-    annotated.save(buf, format='PNG')
-    st.download_button('⬇️ Download annotated image', buf.getvalue(),
-                       file_name='layout.png', mime='image/png')
-
-    # Reading order summary
-    st.subheader('📋 Reading Order')
+    ax = axes[1]
+    ax.imshow(img)
+    ax.set_title('SALG Semantic Groups (reading order)', fontsize=14, fontweight='bold')
     for g in groups:
-        st.write(f'`[{g.reading_order:02d}]` **{g.group_type}** — '
-                 f'{[e.cls_name for e in g.elements]}')
+        x1, y1, x2, y2 = g.bbox
+        c = GROUP_COLORS.get(g.group_type, '#AAAAAA')
+        ax.add_patch(patches.Rectangle((x1,y1), x2-x1, y2-y1,
+                     linewidth=2, edgecolor=c, facecolor=c, alpha=0.12))
+        ax.add_patch(patches.Rectangle((x1,y1), x2-x1, y2-y1,
+                     linewidth=2, edgecolor=c, facecolor='none'))
+        ax.text(x1+4, y1+14, f'#{g.reading_order} {g.group_type}',
+                fontsize=7, color='white', fontweight='bold',
+                bbox=dict(facecolor=c, alpha=0.85, pad=2, edgecolor='none'))
+    ax.axis('off')
 
-    # JSON output
-    if show_json:
-        st.subheader('🗂️ JSON Output')
-        json_out = groups_to_json(groups, uploaded.name)
-        st.json(json_out)
-        st.download_button('⬇️ Download JSON', json.dumps(json_out, indent=2),
-                           file_name='layout.json', mime='application/json')
+    plt.tight_layout()
+    return fig
+
+with st.sidebar:
+    st.header("⚙️ Settings")
+    model_path = st.text_input(
+        "Model path (.pt)",
+        value=r"D:\Projects_Main\DL_LA_2\yolo26s_doclaynet_best.pt",
+    )
+    device = st.selectbox("Device", ["cpu", "0", "cuda"], index=0)
+
+st.title("📄 Document Layout Analysis")
+st.markdown(
+    "**YOLOv12-S** fine-tuned on **DocLayNet** — detects 11 document layout classes "
+    "and applies **SALG** (Semantic-Aware Layout Grouping) to build a clean reading order."
+)
+st.divider()
+
+uploaded = st.file_uploader(
+    "Upload a document image",
+    type=["png", "jpg", "jpeg", "bmp", "tiff", "webp"],
+)
+if uploaded is None:
+    st.stop()
+
+img = PILImage.open(uploaded).convert("RGB")
+iw, ih = img.size
+st.image(img, caption=f"{uploaded.name}  ·  {iw}×{ih} px", use_container_width=True)
+
+if not Path(model_path).exists():
+    st.error(f"**Model not found:** `{model_path}`  \nUpdate the path in the sidebar ↖")
+    st.stop()
+
+model = load_model(model_path)
+
+with st.spinner("Running YOLO inference…"):
+    detections, iw, ih = run_inference(model, img, device)
+
+with st.spinner("Applying SALG…"):
+    groups, salg_obj = run_salg(detections, iw, ih)
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Raw detections", len(detections))
+c2.metric("SALG groups",    len(groups))
+n_cols = SALG(ih, iw)._detect_columns(
+    [d for d in detections if d.cls_name in SALG.FLOW_CLASSES | SALG.HEADING_CLASSES])
+c3.metric("Columns detected", n_cols)
+
+st.subheader("Visualisation")
+with st.spinner("Rendering…"):
+    fig = build_figure(img, detections, groups)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130, bbox_inches="tight")
+    buf.seek(0)
+    plt.close(fig)
+st.image(buf, use_container_width=True)
+
+with st.expander("📊 Detections by class "):
+    counts = Counter(g.group_type for g in groups)
+    if counts:
+        names = list(counts.keys())
+        vals  = [counts[k] for k in names]
+        fig2, ax2 = plt.subplots(figsize=(8, max(3, len(names) * 0.55)))
+        bars = ax2.barh(names, vals, color=[GROUP_COLORS.get(n, '#AAA') for n in names])
+        ax2.bar_label(bars, padding=3, fontsize=10)
+        ax2.set_xlabel("Count"); ax2.set_title("Groups per type (post-SALG + remap)"); ax2.invert_yaxis()
+        plt.tight_layout(); st.pyplot(fig2); plt.close(fig2)
+    else:
+        st.write("No groups found.")
+
+with st.expander("📋 SALG reading order"):
+    st.table([
+        {"Order": g.reading_order, "Type": g.group_type,
+         "Elements": ", ".join(e.cls_name for e in g.elements),
+         "Bbox": [round(v) for v in g.bbox]}
+        for g in groups
+    ])
+
+st.subheader("💾 Export")
+dl1, dl2 = st.columns(2)
+stem = Path(uploaded.name).stem
+with dl1:
+    buf.seek(0)
+    st.download_button("⬇️ Visualisation (PNG)", data=buf,
+                       file_name=f"{stem}_doclayout.png", mime="image/png")
+with dl2:
+    st.download_button("⬇️ SALG layout (JSON)",
+                       data=json.dumps(groups_to_json(groups, uploaded.name), indent=2).encode(),
+                       file_name=f"{stem}_salg.json", mime="application/json")
