@@ -1,186 +1,151 @@
 import streamlit as st
-import cv2
 import numpy as np
-from PIL import Image
+import json
+import io
+from PIL import Image, ImageDraw, ImageFont
 from ultralytics import YOLO
-import fitz  # PyMuPDF
-import tempfile
-import os
+from salg import SALG, Detection, SemanticGroup, groups_to_json
 
-# --- Page Config ---
-st.set_page_config(
-    page_title="YOLO Document Layout Analysis",
-    page_icon="📄",
-    layout="wide",
-)
+# ── Config ───────────────────────────────────────────────────────────────────
+MODEL_PATH = "yolo26s_doclaynet_best.pt"
 
-# --- Styling ---
-st.markdown("""
-<style>
-    .main {
-        background-color: #f5f7f9;
-    }
-    .stButton>button {
-        width: 100%;
-        border-radius: 5px;
-        height: 3em;
-        background-color: #007bff;
-        color: white;
-    }
-    .stProgress .st-bo {
-        background-color: #007bff;
-    }
-</style>
-""", unsafe_allow_html=True)
+CLASSES = [
+    'Caption', 'Footnote', 'Formula', 'List-item', 'Page-footer',
+    'Page-header', 'Picture', 'Section-header', 'Table', 'Text', 'Title'
+]
 
-# --- Title & Description ---
-st.title("🎯 YOLO Document Layout Analysis")
-st.markdown("""
-Upload a **PDF**, **PNG**, or **JPG** document to detect layout elements like **Titles, Tables, Pictures, and Text Blocks**.
-Powered by YOLOv8/v10/v11 (DocLayNet).
-""")
-
-# --- Constants & Sidebar ---
-CLASS_NAMES = {
-    0: 'Caption',
-    1: 'Footnote',
-    2: 'Formula',
-    3: 'List-item',
-    4: 'Page-footer',
-    5: 'Page-header',
-    6: 'Picture',
-    7: 'Section-header',
-    8: 'Table',
-    9: 'Text',
-    10: 'Title'
+REMAP = {
+    'Title'          : 'Text',
+    'Section-header' : 'Picture',
 }
 
-# Distinct colors for each class (RGBA)
-CLASS_COLORS = {
-    0: (255, 165, 0),    # Caption: Orange
-    1: (128, 128, 128),  # Footnote: Gray
-    2: (128, 0, 128),    # Formula: Purple
-    3: (0, 191, 255),    # List-item: DeepSkyBlue
-    4: (50, 205, 50),     # Page-footer: LimeGreen
-    5: (34, 139, 34),     # Page-header: ForestGreen
-    6: (255, 0, 0),       # Picture: Red
-    7: (255, 69, 0),      # Section-header: RedOrange
-    8: (0, 255, 255),     # Table: Cyan
-    9: (255, 255, 0),     # Text: Yellow
-    10: (220, 20, 60)     # Title: Crimson
+GROUP_COLORS = {
+    'text'            : '#3498DB',
+    'title'           : '#27AE60',
+    'image'           : '#F39C12',
+    'flow'            : '#3498DB',
+    'margin'          : '#95A5A6',
+    'isolated_caption': '#BDC3C7',
 }
 
-st.sidebar.title("🛠️ Model Settings")
-conf_threshold = st.sidebar.slider("Confidence Threshold", 0.1, 1.0, 0.25)
-iou_threshold = st.sidebar.slider("IoU Threshold", 0.1, 1.0, 0.45)
-model_path = "final_doclayout_model.pt"
+GROUP_REMAP = {
+    'float'  : 'title',
+    'title'  : 'text',
+    'section': 'image',
+}
 
-# --- Model Loading ---
+# ── Load model once ───────────────────────────────────────────────────────────
 @st.cache_resource
-def load_model(path):
-    if not os.path.exists(path):
-        st.error(f"Model file not found at {path}. Please ensure 'final_doclayout_model.pt' is in the project root.")
-        return None
-    return YOLO(path)
+def load_model():
+    return YOLO(MODEL_PATH)
 
-model = load_model(model_path)
+# ── Helper: smart remap ───────────────────────────────────────────────────────
+def smart_remap(d):
+    name = REMAP.get(d.cls_name, d.cls_name)
+    if d.cls_name == 'Table':
+        aspect = d.w / max(d.h, 1)
+        if aspect > 4:
+            name = 'Text'
+    return Detection(
+        cls_name = name,
+        cls_id   = CLASSES.index(name),
+        conf     = d.conf,
+        box      = d.box
+    )
 
-# --- Helper Functions ---
-def draw_detections(image, detections):
-    """Draw bounding boxes and labels on the image."""
-    img_array = np.array(image)
-    overlay = img_array.copy()
-    
-    for det in detections:
-        x1, y1, x2, y2 = map(int, det.xyxy[0])
-        conf = float(det.conf[0])
-        cls = int(det.cls[0])
-        
-        color = CLASS_COLORS.get(cls, (255, 255, 255))
-        label = f"{CLASS_NAMES.get(cls, 'Unknown')} {conf:.2f}"
-        
-        # Draw bounding box
-        cv2.rectangle(img_array, (x1, y1), (x2, y2), color, 2)
-        
-        # Transparent fill
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
-        
-        # Label background
-        (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-        cv2.rectangle(img_array, (x1, y1 - 25), (x1 + w, y1), color, -1)
-        cv2.putText(img_array, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+# ── Helper: draw groups on image ──────────────────────────────────────────────
+def draw_groups(img: Image.Image, groups) -> Image.Image:
+    img = img.copy().convert('RGBA')
+    overlay = Image.new('RGBA', img.size, (0,0,0,0))
+    draw = ImageDraw.Draw(overlay)
 
-    # Blend overlay for transparency
-    alpha = 0.2
-    cv2.addWeighted(overlay, alpha, img_array, 1 - alpha, 0, img_array)
-    return Image.fromarray(img_array)
+    for g in groups:
+        x1,y1,x2,y2 = g.bbox
+        label = GROUP_REMAP.get(g.group_type, g.group_type)
+        hex_c = GROUP_COLORS.get(label, '#AAAAAA').lstrip('#')
+        r,g_c,b = tuple(int(hex_c[i:i+2],16) for i in (0,2,4))
 
-# --- File Processing ---
-uploaded_file = st.file_uploader("Upload Document", type=["pdf", "png", "jpg", "jpeg"])
+        # Fill
+        draw.rectangle([x1,y1,x2,y2], fill=(r,g_c,b,30))
+        # Border
+        draw.rectangle([x1,y1,x2,y2], outline=(r,g_c,b,220), width=2)
+        # Label
+        draw.rectangle([x1,y1,x1+120,y1+18], fill=(r,g_c,b,200))
+        draw.text((x1+4,y1+2), f'#{g.reading_order} {label}', fill=(255,255,255,255))
 
-if uploaded_file is not None and model is not None:
-    file_extension = uploaded_file.name.split(".")[-1].lower()
-    
-    if file_extension == "pdf":
-        # Process PDF
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(uploaded_file.getvalue())
-            tmp_path = tmp.name
-        
-        doc = fitz.open(tmp_path)
-        total_pages = len(doc)
-        
-        st.sidebar.divider()
-        page_number = st.sidebar.number_input(f"Page (1-{total_pages})", min_value=1, max_value=total_pages, value=1) - 1
-        
-        # Convert PDF page to PIL Image
-        page = doc[page_number]
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # Scale up for better detection
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        
-        doc.close()
-        os.remove(tmp_path)
-    else:
-        # Process Image
-        img = Image.open(uploaded_file).convert("RGB")
+    return Image.alpha_composite(img, overlay).convert('RGB')
 
-    # --- Inference ---
-    with st.spinner("Analyzing layout..."):
-        results = model.predict(img, conf=conf_threshold, iou=iou_threshold)
-        detections = results[0].boxes
-    
-    col1, col2 = st.columns([2, 1])
-    
+# ── Streamlit UI ──────────────────────────────────────────────────────────────
+st.set_page_config(page_title='Document Layout Analyser', layout='wide')
+st.title('📄 Document Layout Analyser')
+st.caption('Upload a document image — YOLO + SALG will detect and group layout elements.')
+
+uploaded = st.file_uploader('Upload image', type=['png','jpg','jpeg','webp'])
+
+with st.sidebar:
+    st.header('⚙️ Settings')
+    conf_thresh = st.slider('YOLO confidence',  0.10, 0.80, 0.25, 0.05)
+    iou_thresh  = st.slider('YOLO IoU',         0.10, 0.80, 0.45, 0.05)
+    min_conf    = st.slider('SALG min conf',     0.10, 0.80, 0.35, 0.05)
+    show_json   = st.checkbox('Show JSON output', value=True)
+
+if uploaded:
+    img = Image.open(uploaded).convert('RGB')
+    img_w, img_h = img.size
+
+    with st.spinner('Running inference...'):
+        model = load_model()
+        result = model(
+            np.array(img),
+            imgsz=1280, conf=conf_thresh, iou=iou_thresh,
+            device='cpu', verbose=False
+        )[0]
+
+    # Build detections
+    detections = [
+        Detection(CLASSES[int(b.cls)], int(b.cls), float(b.conf), tuple(b.xyxy[0].tolist()))
+        for b in result.boxes
+    ]
+
+    # Remap labels
+    detections = [smart_remap(d) for d in detections]
+
+    # Run SALG
+    salg = SALG(img_h=img_h, img_w=img_w, min_conf=min_conf)
+    groups = salg.group(detections)
+
+    # Rename group types
+    for g in groups:
+        g.group_type = GROUP_REMAP.get(g.group_type, g.group_type)
+
+    # Draw
+    annotated = draw_groups(img, groups)
+
+    # Display
+    col1, col2 = st.columns(2)
     with col1:
-        st.subheader("🖼️ Layout Visualization")
-        result_img = draw_detections(img, detections)
-        st.image(result_img, use_column_width=True)
-        
+        st.subheader('Original')
+        st.image(img, use_container_width=True)
     with col2:
-        st.subheader("📊 Detected Elements")
-        if len(detections) > 0:
-            counts = {}
-            for det in detections:
-                cls = int(det.cls[0])
-                name = CLASS_NAMES.get(cls, "Unknown")
-                counts[name] = counts.get(name, 0) + 1
-            
-            for name, count in sorted(counts.items()):
-                st.write(f"**{name}:** {count}")
-                
-            # Detailed Table
-            det_data = []
-            for det in detections:
-                cls = int(det.cls[0])
-                name = CLASS_NAMES.get(cls, "Unknown")
-                conf = float(det.conf[0])
-                det_data.append({"Element": name, "Confidence": f"{conf:.2%}"})
-            st.table(det_data)
-        else:
-            st.info("No elements detected with current settings.")
+        st.subheader(f'Layout Groups ({len(groups)} found)')
+        st.image(annotated, use_container_width=True)
 
-else:
-    if model is None:
-        st.warning("Please upload a trained model first.")
-    else:
-        st.info("Upload a file to get started!")
+    # Download annotated image
+    buf = io.BytesIO()
+    annotated.save(buf, format='PNG')
+    st.download_button('⬇️ Download annotated image', buf.getvalue(),
+                       file_name='layout.png', mime='image/png')
+
+    # Reading order summary
+    st.subheader('📋 Reading Order')
+    for g in groups:
+        st.write(f'`[{g.reading_order:02d}]` **{g.group_type}** — '
+                 f'{[e.cls_name for e in g.elements]}')
+
+    # JSON output
+    if show_json:
+        st.subheader('🗂️ JSON Output')
+        json_out = groups_to_json(groups, uploaded.name)
+        st.json(json_out)
+        st.download_button('⬇️ Download JSON', json.dumps(json_out, indent=2),
+                           file_name='layout.json', mime='application/json')
