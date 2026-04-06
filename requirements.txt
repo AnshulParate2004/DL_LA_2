@@ -2,5 +2,4 @@ streamlit>=1.38.0
 ultralytics
 Pillow
 matplotlib
-opencv-python-headless
 numpy<2.0.0
