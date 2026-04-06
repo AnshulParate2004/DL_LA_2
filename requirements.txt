@@ -3,4 +3,5 @@ ultralytics
 pymupdf
 Pillow
 matplotlib
+opencv-python-headless
 numpy>=2.1.0
