@@ -88,7 +88,7 @@ with st.sidebar:
     st.header("⚙️ Settings")
     model_path = st.text_input(
         "Model path (.pt)",
-        value=r"D:\Projects_Main\DL_LA_2\yolo26s_doclaynet_best.pt",
+        value="yolo26s_doclaynet_best.pt",
     )
     device = st.selectbox("Device", ["cpu", "0", "cuda"], index=0)
 
